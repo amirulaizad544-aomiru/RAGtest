@@ -1,0 +1,20 @@
+# Fixes SSL verification errors on machines where something (e.g. antivirus
+# HTTPS scanning, corporate proxy) re-signs HTTPS traffic with a certificate
+# Python doesn't trust by default. Makes Python trust the OS certificate
+# store instead. Harmless to keep installed even if you don't need it.
+pip-system-certs
+
+google-genai
+python-dotenv
+pdfplumber
+sentence-transformers
+numpy
+fastapi
+uvicorn[standard]
+
+# OCR fallback for scanned PDFs (see ocr_core.py). Requires the Tesseract
+# OCR engine to also be installed separately (not a pip package) --
+# see ocr_core.py's module docstring.
+pymupdf
+pytesseract
+pillow
