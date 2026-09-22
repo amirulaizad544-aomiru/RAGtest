@@ -31,13 +31,24 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CACHE_PATH = os.path.join(os.path.dirname(__file__), ".rag_index_cache.npz")
 CHUNK_SIZE = 800   # characters per chunk, used when a section is too big to keep whole
 CHUNK_OVERLAP = 100
-TOP_K = 4
+TOP_K = 4         # chunks pulled from the main (non-resume) memory
+RESUME_TOP_K = 6  # chunks pulled from the resume memory, only for comparison questions
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 GEMINI_MODEL = "gemini-3.6-flash"
 
 # A line like "EDUCATION" or "WORK EXPERIENCE" is treated as a section header:
 # short, mostly uppercase letters, no sentence punctuation.
 SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Z0-9 &/\-]{2,40}$")
+
+# Filename heuristic used to split documents into two separate memories (see
+# RagIndex): anything with "resume" or "cv" in its filename goes into the
+# resume memory, everything else (employment letter, NDA, ...) goes into the
+# main memory that's searched by default.
+RESUME_FILENAME_RE = re.compile(r"resume|\bcv\b", re.IGNORECASE)
+
+
+def is_resume_filename(filename):
+    return bool(RESUME_FILENAME_RE.search(filename))
 
 
 def normalize_whitespace(text):
@@ -81,32 +92,46 @@ def fingerprint_pdfs(data_dir):
     return "|".join(parts)
 
 
+CACHE_FIELDS = (
+    "document_names",
+    "chunks", "sources", "embeddings",                    # main memory
+    "resume_chunks", "resume_sources", "resume_embeddings",  # resume memory
+)
+
+
 def load_index_cache(cache_path, fingerprint):
-    """Load a previously saved (document_names, chunks, sources, embeddings)
-    tuple from cache_path, or return None if there's no cache or it was built
-    from different PDFs (OCR + embedding are slow, so this avoids redoing
-    them on every process restart when data_dir hasn't changed)."""
+    """Load a previously saved index (main memory + resume memory) from
+    cache_path, or return None if there's no cache, it was built from
+    different PDFs, or it predates the two-memory split (OCR + embedding are
+    slow, so this avoids redoing them on every process restart when data_dir
+    hasn't changed)."""
     if not os.path.exists(cache_path):
         return None
     with np.load(cache_path, allow_pickle=True) as data:
-        if str(data["fingerprint"]) != fingerprint:
+        if str(data["fingerprint"]) != fingerprint or not all(f in data for f in CACHE_FIELDS):
             return None
-        return (
-            list(data["document_names"]),
-            list(data["chunks"]),
-            list(data["sources"]),
-            data["embeddings"],
-        )
+        return {
+            "document_names": list(data["document_names"]),
+            "chunks": list(data["chunks"]),
+            "sources": list(data["sources"]),
+            "embeddings": data["embeddings"],
+            "resume_chunks": list(data["resume_chunks"]),
+            "resume_sources": list(data["resume_sources"]),
+            "resume_embeddings": data["resume_embeddings"],
+        }
 
 
-def save_index_cache(cache_path, fingerprint, document_names, chunks, sources, embeddings):
+def save_index_cache(cache_path, fingerprint, index):
     np.savez(
         cache_path,
         fingerprint=fingerprint,
-        document_names=np.array(document_names, dtype=object),
-        chunks=np.array(chunks, dtype=object),
-        sources=np.array(sources, dtype=object),
-        embeddings=embeddings,
+        document_names=np.array(index["document_names"], dtype=object),
+        chunks=np.array(index["chunks"], dtype=object),
+        sources=np.array(index["sources"], dtype=object),
+        embeddings=index["embeddings"],
+        resume_chunks=np.array(index["resume_chunks"], dtype=object),
+        resume_sources=np.array(index["resume_sources"], dtype=object),
+        resume_embeddings=index["resume_embeddings"],
     )
 
 
@@ -220,6 +245,51 @@ Context:
 Question: {query}"""
 
 
+# Words/phrases used only as a fallback (see classify_wants_resume) if the
+# Gemini classification call itself fails, e.g. a network hiccup -- so a
+# transient API error doesn't silently make the resume unreachable.
+_RESUME_KEYWORDS_FALLBACK = (
+    "compare", "comparison", "difference", "differences", "differ",
+    "versus", " vs ", " vs. ", "consistent", "inconsist", "match",
+    "cross-reference", "cross reference", "discrepanc", "align with", "same as",
+    "relevant", "relate", "related", "relation",
+)
+
+
+def _keyword_wants_resume(query):
+    lowered = f" {query.lower()} "
+    return bool(RESUME_FILENAME_RE.search(query)) or any(k in lowered for k in _RESUME_KEYWORDS_FALLBACK)
+
+
+def classify_wants_resume(client, query):
+    """Ask Gemini whether answering this question needs the resume pulled in
+    alongside the main-memory documents -- either to compare/cross-check it
+    against them, or because the question is about the resume itself (e.g.
+    "is this relevant to my resume?"). Uses a tiny yes/no prompt with a
+    5-token cap so the extra round-trip stays fast and cheap.
+
+    Falls back to a keyword heuristic if the classification call itself
+    errors (e.g. a network hiccup), rather than silently never using the
+    resume for the rest of that request.
+    """
+    prompt = (
+        f'Question: "{query}"\n\n'
+        "Does answering this question require the user's resume/CV -- either "
+        "to look at it directly, or to compare/cross-check it against other "
+        "documents (e.g. an employment letter or NDA)? Reply with exactly one "
+        "word: yes or no."
+    )
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={"max_output_tokens": 5, "temperature": 0},
+        )
+        return response.text.strip().lower().startswith("y")
+    except Exception:
+        return _keyword_wants_resume(query)
+
+
 def ask_gemini(client, prompt):
     response = client.models.generate_content(
         model=GEMINI_MODEL,
@@ -237,9 +307,18 @@ def ask_gemini_stream(client, prompt):
 
 
 class RagIndex:
-    """Loads PDFs and builds the embedding index once, so repeated queries
-    (e.g. from a chat UI) don't reload the embedding model or re-embed the
-    documents on every request."""
+    """Loads PDFs and builds two separate embedding indexes once, so repeated
+    queries (e.g. from a chat UI) don't reload the embedding model or
+    re-embed the documents on every request:
+
+      - self.chunks/sources/embeddings: the "main memory" -- every document
+        except the resume (employment letter, NDA, ...). This is what a
+        normal question is answered from.
+      - self.resume_chunks/resume_sources/resume_embeddings: the "resume
+        memory" -- only pulled in on top of the main memory when the
+        question looks like it wants the resume compared/cross-checked
+        against the other documents (see is_comparison_query).
+    """
 
     def __init__(self, data_dir=DATA_DIR, cache_path=CACHE_PATH):
         self.data_dir = data_dir
@@ -257,26 +336,56 @@ class RagIndex:
         fingerprint = fingerprint_pdfs(self.data_dir)
         cached = load_index_cache(self.cache_path, fingerprint)
         if cached:
-            self.document_names, self.chunks, self.sources, self.embeddings = cached
+            self.document_names = cached["document_names"]
+            self.chunks, self.sources, self.embeddings = (
+                cached["chunks"], cached["sources"], cached["embeddings"],
+            )
+            self.resume_chunks, self.resume_sources, self.resume_embeddings = (
+                cached["resume_chunks"], cached["resume_sources"], cached["resume_embeddings"],
+            )
             return
 
         documents = load_pdfs(self.data_dir)
         self.document_names = list(documents.keys())
-        self.chunks, self.sources = build_index(documents)
-        if self.chunks:
-            self.embeddings = embed_texts(self.embed_model, self.chunks)
-        else:
-            self.embeddings = np.empty((0, 0))
-        save_index_cache(
-            self.cache_path, fingerprint, self.document_names, self.chunks, self.sources, self.embeddings
+
+        main_documents = {name: text for name, text in documents.items() if not is_resume_filename(name)}
+        resume_documents = {name: text for name, text in documents.items() if is_resume_filename(name)}
+
+        self.chunks, self.sources = build_index(main_documents)
+        self.embeddings = embed_texts(self.embed_model, self.chunks) if self.chunks else np.empty((0, 0))
+
+        self.resume_chunks, self.resume_sources = build_index(resume_documents)
+        self.resume_embeddings = (
+            embed_texts(self.embed_model, self.resume_chunks) if self.resume_chunks else np.empty((0, 0))
         )
 
-    def ask(self, query, k=TOP_K):
-        if not self.chunks:
-            raise ValueError(f"No PDFs found in {self.data_dir}")
-        retrieved = retrieve(
-            self.embed_model, query, self.chunks, self.sources, self.embeddings, k=k
+        save_index_cache(self.cache_path, fingerprint, {
+            "document_names": self.document_names,
+            "chunks": self.chunks, "sources": self.sources, "embeddings": self.embeddings,
+            "resume_chunks": self.resume_chunks, "resume_sources": self.resume_sources,
+            "resume_embeddings": self.resume_embeddings,
+        })
+
+    def _retrieve_for(self, query, k, resume_k):
+        """Top-k chunks from the main memory, plus (only if Gemini judges the
+        question needs the resume, and only if a resume was actually found)
+        top resume_k chunks from the resume memory, so Gemini has both sides
+        to compare."""
+        retrieved = (
+            retrieve(self.embed_model, query, self.chunks, self.sources, self.embeddings, k=k)
+            if self.chunks else []
         )
+        if self.resume_chunks and classify_wants_resume(self.genai_client, query):
+            retrieved += retrieve(
+                self.embed_model, query, self.resume_chunks, self.resume_sources,
+                self.resume_embeddings, k=resume_k,
+            )
+        return retrieved
+
+    def ask(self, query, k=TOP_K, resume_k=RESUME_TOP_K):
+        if not self.chunks and not self.resume_chunks:
+            raise ValueError(f"No PDFs found in {self.data_dir}")
+        retrieved = self._retrieve_for(query, k, resume_k)
         prompt = build_prompt(query, retrieved)
         answer = ask_gemini(self.genai_client, prompt)
         return {
@@ -287,16 +396,14 @@ class RagIndex:
             ],
         }
 
-    def ask_stream(self, query, k=TOP_K):
+    def ask_stream(self, query, k=TOP_K, resume_k=RESUME_TOP_K):
         """Generator variant of ask(): yields dicts shaped for the NDJSON
         wire format the streaming API endpoint sends to the frontend —
         one "retrieved" event, then zero or more "token" events, then a
         final "done" event."""
-        if not self.chunks:
+        if not self.chunks and not self.resume_chunks:
             raise ValueError(f"No PDFs found in {self.data_dir}")
-        retrieved = retrieve(
-            self.embed_model, query, self.chunks, self.sources, self.embeddings, k=k
-        )
+        retrieved = self._retrieve_for(query, k, resume_k)
         yield {
             "type": "retrieved",
             "chunks": [

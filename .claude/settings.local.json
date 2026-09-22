@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(python -m venv .venv)",
-      "PowerShell(curl.exe -N -X POST http://127.0.0.1:8001/api/ask/stream -H \"Content-Type: application/json\" -d '{\\\\\"question\\\\\": \\\\\"what is my education level\\\\\"}')"
-    ]
-  }
-}
