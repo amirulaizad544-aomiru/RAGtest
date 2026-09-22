@@ -12,6 +12,48 @@ type Message = {
   error?: boolean;
 };
 
+// This app talks to a backend that runs locally (by design -- it processes
+// private documents), so "can't reach the server at all" is an expected,
+// routine state here, not a bug. These messages are shown instead of raw
+// fetch/HTTP/backend error text, which could otherwise leak internal detail
+// (stack traces, API error strings, etc.) into the chat.
+const BACKEND_DOWN_MESSAGE =
+  "This assistant needs its local server running to answer (it keeps your documents private by processing everything on-device). Please ask the admin to start it, then try again.";
+const RATE_LIMIT_MESSAGE =
+  "Too many questions at once -- please wait a moment and try again.";
+const GENERIC_ERROR_MESSAGE =
+  "Something went wrong while answering that. Please try again in a moment.";
+
+class ApiError extends Error {
+  status: number;
+  constructor(status: number) {
+    super("api_error");
+    this.status = status;
+  }
+}
+
+/** Maps a caught error (network failure, non-2xx response, or a mid-stream
+ * "error" event from the backend) to a safe, user-friendly message -- never
+ * the raw exception/response text, which may contain internal detail. */
+function friendlyErrorMessage(err: unknown): string {
+  // fetch() itself throws a TypeError when it can't reach the server at all
+  // (connection refused, DNS failure, etc.) -- exactly the "backend isn't
+  // running" case this app expects to hit routinely.
+  if (err instanceof TypeError) {
+    return BACKEND_DOWN_MESSAGE;
+  }
+  if (err instanceof ApiError) {
+    return err.status === 429 ? RATE_LIMIT_MESSAGE : GENERIC_ERROR_MESSAGE;
+  }
+  // A mid-stream {"type": "error"} event from the backend carries the raw
+  // exception text (e.g. a Gemini quota error) as a plain string -- sniff it
+  // for rate-limit wording rather than ever displaying it verbatim.
+  if (typeof err === "string") {
+    return /quota|rate.?limit|429|resource_exhausted/i.test(err) ? RATE_LIMIT_MESSAGE : GENERIC_ERROR_MESSAGE;
+  }
+  return GENERIC_ERROR_MESSAGE;
+}
+
 const SUGGESTIONS = [
   "Summarize what these documents are about",
   "What is the notice period in the employment letter?",
@@ -122,8 +164,7 @@ export default function Home() {
       });
 
       if (!res.ok || !res.body) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail ?? "Something went wrong.");
+        throw new ApiError(res.status);
       }
 
       const reader = res.body.getReader();
@@ -145,14 +186,14 @@ export default function Home() {
           if (event.type === "token") {
             updateLastMessage((m) => ({ ...m, content: m.content + event.text }));
           } else if (event.type === "error") {
-            updateLastMessage((m) => ({ ...m, content: event.message, error: true }));
+            updateLastMessage((m) => ({ ...m, content: friendlyErrorMessage(event.message as string), error: true }));
           }
         }
       }
     } catch (err) {
       updateLastMessage((m) => ({
         ...m,
-        content: err instanceof Error ? err.message : "Something went wrong.",
+        content: friendlyErrorMessage(err),
         error: true,
       }));
     } finally {

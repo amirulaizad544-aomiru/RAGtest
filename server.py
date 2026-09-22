@@ -20,10 +20,12 @@ from rag_core import RagIndex
 
 app = FastAPI(title="Mini RAG API")
 
-# Next.js dev server runs on localhost:3000 by default.
+# Next.js dev server runs on localhost:3000 by default, but falls back to
+# 3001, 3002, ... if that port is already taken by another project, so allow
+# a small range of likely dev ports rather than just 3000.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origin_regex=r"http://localhost:300\d",
     allow_methods=["*"],
     allow_headers=["*"],
 )
